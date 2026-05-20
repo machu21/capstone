@@ -5,9 +5,8 @@ Admin dialog to test coin dispensing.
 Enter an amount → rounds to nearest ₱5 → dispenses via PCA9685 SG90s.
 """
 
-from gpiozero.pins.lgpio import LGPIOFactory
-from gpiozero import Device
-Device.pin_factory = LGPIOFactory()
+import os
+import time
 
 from PyQt6.QtWidgets import (
     QDialog, QLabel, QPushButton,
@@ -18,28 +17,43 @@ from PyQt6.QtCore import Qt, QTimer
 from utils import screen_size
 from keyboard import install_keyboard
 
+os.environ["BLINKA_FORCEBOARD"] = "RASPBERRY_PI_5"
+
 # ── PCA9685 config ────────────────────────────────────────────────────────────
 PCA9685_ADDRESS = 0x40
-COIN_CHANNELS   = {0: 1, 1: 5, 2: 10, 3: 20}
+FREQ_HZ         = 50
 
-ANGLE_DISPENSE  = 180
-ANGLE_NEUTRAL   =   0
-DISPENSE_MS     = 600
-RETURN_MS       = 400
+# Map Denomination -> PCA9685 Channel
+COIN_CHANNELS = {
+    1:  0,
+    5:  1,
+    10: 2,
+    20: 3
+}
+
+COIN_PW_NEUTRAL  =  500
+COIN_PW_DISPENSE = 2500
+DISPENSE_MS      = 600
+RETURN_MS        = 400
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _us_to_duty(us: int) -> int:
+    """Convert pulse width in microseconds to PCA9685 16-bit duty cycle."""
+    period_us = 1_000_000 / FREQ_HZ
+    return int((us / period_us) * 65535)
 
 def _round_to_nearest_5(amount: float) -> int:
     """Round to nearest multiple of 5."""
     return round(round(amount / 5) * 5)
 
-
 def _break_into_coins(amount: int) -> dict:
     """Greedy breakdown into coin denominations."""
     coins = {}
     remaining = amount
-    for denom in sorted(COIN_CHANNELS.values(), reverse=True):
+    # Fixed: Iterate over keys (denominations), not values (channels)
+    for denom in sorted(COIN_CHANNELS.keys(), reverse=True):
         count = remaining // denom
         if count:
             coins[denom] = count
@@ -63,42 +77,42 @@ class CoinDispenserDialog(QDialog):
         self._scale = scale
 
         self._dispense_queue = []
-        self._coin_servos    = {}
         self._pca            = None
 
         if not self.MOCK_COINS:
-            self._init_pca9685()
+            self._init_hardware()
 
         self._build_ui(scale)
         install_keyboard(self, numeric_inputs={self.amount_input})
 
     # ── Hardware init ─────────────────────────────────────────────────────────
 
-    def _init_pca9685(self):
+    def _init_hardware(self):
         try:
-            from adafruit_pca9685 import PCA9685               # type: ignore
-            from adafruit_motor import servo as adafruit_servo  # type: ignore
-            import board, busio                                  # type: ignore
-            i2c          = busio.I2C(board.SCL, board.SDA)
-            self._pca    = PCA9685(i2c, address=PCA9685_ADDRESS)
-            self._pca.frequency = 50
-            self._coin_servos = {
-                denom: adafruit_servo.Servo(
-                    self._pca.channels[ch],
-                    min_pulse=500,
-                    max_pulse=2400,
-                )
-                for ch, denom in COIN_CHANNELS.items()
-            }
-            # All to neutral on start
-            for s in self._coin_servos.values():
-                s.angle = ANGLE_NEUTRAL
+            import board                          # type: ignore
+            import busio                          # type: ignore
+            from adafruit_pca9685 import PCA9685  # type: ignore
+
+            i2c = busio.I2C(board.SCL, board.SDA)
+            self._pca = PCA9685(i2c, address=PCA9685_ADDRESS)
+            self._pca.frequency = FREQ_HZ
+
+            # Move all servos to neutral on startup
+            for ch in COIN_CHANNELS.values():
+                self._pca.channels[ch].duty_cycle = _us_to_duty(COIN_PW_NEUTRAL)
+            
+            # Allow time to reach neutral, then cut PWM to prevent jitter/heat
+            time.sleep(0.5)
+            for ch in COIN_CHANNELS.values():
+                self._pca.channels[ch].duty_cycle = 0
+
         except Exception as e:
             QMessageBox.warning(
                 self, "Coin Dispenser",
                 f"PCA9685 init failed — running in mock mode.\n{e}"
             )
             self.MOCK_COINS = True
+            self._pca = None
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -315,32 +329,46 @@ class CoinDispenserDialog(QDialog):
             f"Dispensing ₱{denom}...  ({remaining} coins remaining)"
         )
 
-        if not self.MOCK_COINS and denom in self._coin_servos:
-            self._coin_servos[denom].angle = ANGLE_DISPENSE
+        if not self.MOCK_COINS and self._pca:
+            ch = COIN_CHANNELS.get(denom)
+            if ch is not None:
+                self._pca.channels[ch].duty_cycle = _us_to_duty(COIN_PW_DISPENSE)
         else:
-            print(f"[MOCK] Dispense ₱{denom}")
+            print(f"[MOCK] Dispense ₱{denom} -> DISPENSE")
 
         QTimer.singleShot(DISPENSE_MS, lambda: self._return_servo(denom))
 
     def _return_servo(self, denom: int):
-        if not self.MOCK_COINS and denom in self._coin_servos:
-            self._coin_servos[denom].angle = ANGLE_NEUTRAL
-        QTimer.singleShot(RETURN_MS, self._dispense_next)
+        """Returns the servo to neutral position."""
+        if not self.MOCK_COINS and self._pca:
+            ch = COIN_CHANNELS.get(denom)
+            if ch is not None:
+                self._pca.channels[ch].duty_cycle = _us_to_duty(COIN_PW_NEUTRAL)
+        else:
+            print(f"[MOCK] Dispense ₱{denom} -> NEUTRAL")
+            
+        # Give it time to mechanically return, then cut the PWM
+        QTimer.singleShot(RETURN_MS, lambda: self._stop_servo_and_continue(denom))
+        
+    def _stop_servo_and_continue(self, denom: int):
+        """Cuts the PWM signal to prevent overheating/jitter, then triggers next coin."""
+        if not self.MOCK_COINS and self._pca:
+            ch = COIN_CHANNELS.get(denom)
+            if ch is not None:
+                self._pca.channels[ch].duty_cycle = 0
+        else:
+            print(f"[MOCK] Dispense ₱{denom} -> STOP PWM")
+            
+        self._dispense_next()
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def _cleanup(self):
-        if not self.MOCK_COINS:
-            for s in self._coin_servos.values():
-                try:
-                    s.angle = ANGLE_NEUTRAL
-                except Exception:
-                    pass
-            if self._pca:
-                try:
-                    self._pca.deinit()
-                except Exception:
-                    pass
+        if self._pca:
+            for ch in COIN_CHANNELS.values():
+                self._pca.channels[ch].duty_cycle = 0
+            self._pca.deinit()
+            self._pca = None
 
     def accept(self):
         self._cleanup()

@@ -1,7 +1,7 @@
 """
 hardware/test_servo.py
 ──────────────────────
-Manual test for the MG996R sorter servo via PCA9685 channel 5.
+Manual test for the MG996R sorter servo via PCA9685 channel 4.
 
 Positions:
     Neutral   → 1500us (pointing forward)
@@ -9,9 +9,9 @@ Positions:
     Qualified → 2100us (right, +60°)
 
 Wiring:
-    PCA9685 Ch 5 → MG996R Signal
-    PCA9685 V+   → External 6V (high torque)
-    MG996R GND   → External GND + Pi GND (common ground)
+    PCA9685 Ch 4 → MG996R Signal
+    PCA9685 V+   → External 6V
+    PCA9685 GND  → External GND + Pi GND
     PCA9685 SDA  → GPIO 2 (Pin 3)
     PCA9685 SCL  → GPIO 3 (Pin 5)
 
@@ -22,18 +22,20 @@ Run:
 import sys
 import traceback
 import time
+import os
+
+os.environ["BLINKA_FORCEBOARD"] = "RASPBERRY_PI_5"
 
 # ── PCA9685 config ────────────────────────────────────────────────────────────
 PCA9685_ADDRESS = 0x40
-SERVO_CHANNEL   = 5       # MG996R on channel 5
+SERVO_CHANNEL   = 4
 FREQ_HZ         = 50
 
 # Pulse widths in microseconds
-PW_NEUTRAL   = 1500   # forward
-PW_REJECT    =  900   # left  → reject
-PW_QUALIFIED = 2100   # right → qualified
+PW_NEUTRAL   = 1500
+PW_REJECT    =  900
+PW_QUALIFIED = 2100
 
-# Movement settle time
 MOVE_DELAY = 0.5
 
 
@@ -65,18 +67,19 @@ class Debug:
 
 # ── PCA9685 setup ─────────────────────────────────────────────────────────────
 
-def _us_to_duty(us: int, freq: int = FREQ_HZ) -> int:
-    """Convert pulse width in microseconds to PCA9685 12-bit duty value (0–4095)."""
-    period_us = 1_000_000 / freq
-    return int((us / period_us) * 4096)
+def _us_to_duty(us: int) -> int:
+    """Convert pulse width in microseconds to PCA9685 16-bit duty cycle."""
+    period_us    = 1_000_000 / FREQ_HZ
+    duty_12bit   = int((us / period_us) * 4096)
+    return duty_12bit << 4   # 12-bit → 16-bit
 
 
 def init_servo():
     Debug.step(1, "Importing adafruit libraries")
     try:
-        import board                                         # type: ignore
-        import busio                                         # type: ignore
-        from adafruit_pca9685 import PCA9685                 # type: ignore
+        import board                          # type: ignore
+        import busio                          # type: ignore
+        from adafruit_pca9685 import PCA9685  # type: ignore
         Debug.ok("Libraries imported.")
     except ImportError as e:
         Debug.error(
@@ -85,34 +88,36 @@ def init_servo():
         )
         sys.exit(1)
 
-    Debug.step(2, f"Connecting PCA9685 at 0x{PCA9685_ADDRESS:02X}")
+    Debug.step(2, f"Connecting PCA9685 at 0x{PCA9685_ADDRESS:02X}  Ch={SERVO_CHANNEL}")
     try:
-        i2c = busio.I2C(board.SCL, board.SDA)               # type: ignore
-        pca = PCA9685(i2c, address=PCA9685_ADDRESS)          # type: ignore
+        import board, busio                          # type: ignore
+        from adafruit_pca9685 import PCA9685         # type: ignore
+        i2c = busio.I2C(board.SCL, board.SDA)
+        pca = PCA9685(i2c, address=PCA9685_ADDRESS)
         pca.frequency = FREQ_HZ
-        Debug.ok(f"PCA9685 ready at 0x{PCA9685_ADDRESS:02X}, {FREQ_HZ}Hz.")
+        Debug.ok(f"PCA9685 ready. Frequency={FREQ_HZ}Hz.")
         return pca
     except Exception:
         Debug.error(
             "Failed to connect PCA9685.\n"
-            "Check:\n"
-            "  SDA → GPIO 2  SCL → GPIO 3\n"
-            "  Run: i2cdetect -y 1  (should show 0x40)"
+            "Check: i2cdetect -y 1  (should show 0x40)"
         )
         traceback.print_exc()
         sys.exit(1)
 
 
 def set_pulse(pca, us: int):
-    """Set MG996R pulse width in microseconds."""
-    duty = _us_to_duty(us)
-    pca.channels[SERVO_CHANNEL].duty_cycle = duty << 4   # 12-bit → 16-bit
+    pca.channels[SERVO_CHANNEL].duty_cycle = _us_to_duty(us)
+
+
+def stop_pulse(pca):
+    pca.channels[SERVO_CHANNEL].duty_cycle = 0
 
 
 def cleanup(pca):
     set_pulse(pca, PW_NEUTRAL)
     time.sleep(0.3)
-    pca.channels[SERVO_CHANNEL].duty_cycle = 0
+    stop_pulse(pca)
     pca.deinit()
     Debug.info("PCA9685 deinitialized.")
 
@@ -123,19 +128,22 @@ def go_neutral(pca):
     set_pulse(pca, PW_NEUTRAL)
     Debug.ok(f"NEUTRAL   → {PW_NEUTRAL}us  (forward)")
     time.sleep(MOVE_DELAY)
+    
 
 def go_reject(pca):
     set_pulse(pca, PW_REJECT)
     Debug.ok(f"REJECT    → {PW_REJECT}us  (left)")
     time.sleep(MOVE_DELAY)
+    
 
 def go_qualified(pca):
     set_pulse(pca, PW_QUALIFIED)
     Debug.ok(f"QUALIFIED → {PW_QUALIFIED}us  (right)")
     time.sleep(MOVE_DELAY)
+    
 
 def go_stop(pca):
-    pca.channels[SERVO_CHANNEL].duty_cycle = 0
+    stop_pulse(pca)
     Debug.ok("STOP — PWM signal cut.")
 
 def go_pulse(pca, us: int):
@@ -214,13 +222,13 @@ def interactive(pca):
     print()
     Debug.info(
         "Commands:\n"
-        "  neutral / n      → forward position\n"
-        "  reject  / r      → left position\n"
-        "  qualify / q      → right position\n"
-        "  stop    / s      → cut PWM signal\n"
-        "  sweep            → reject → neutral → qualified → neutral\n"
-        "  pulse <us>       → custom pulse width e.g. pulse 1200\n"
-        "  scan             → step through 800–2200us to find exact positions\n"
+        "  neutral / n      → forward\n"
+        "  reject  / r      → left\n"
+        "  qualify / q      → right\n"
+        "  stop    / s      → cut PWM\n"
+        "  sweep            → full sweep\n"
+        "  pulse <us>       → custom e.g. pulse 1200\n"
+        "  scan             → step 800–2200us to find exact positions\n"
         "  quit\n"
     )
     while True:
@@ -238,7 +246,7 @@ def interactive(pca):
             go_neutral(pca)
         elif cmd in ("reject", "r"):
             go_reject(pca)
-        elif cmd in ("qualify", "qualified") or (cmd == "q" and len(parts) == 1):
+        elif cmd in ("qualify", "qualified"):
             go_qualified(pca)
         elif cmd in ("stop", "s"):
             go_stop(pca)
@@ -260,13 +268,9 @@ def interactive(pca):
 
 
 def _scan(pca):
-    """Step through pulse widths to find exact positions for your servo."""
-    Debug.info(
-        "Scanning 800→2200us in 100us steps.\n"
-        "  Note the us value at neutral, reject, and qualified — press Enter each step."
-    )
+    Debug.info("Scanning 800→2200us in 100us steps. Press Enter each step.")
     for us in range(800, 2300, 100):
-        Debug.info(f"  {us}us — press Enter to continue...")
+        Debug.info(f"  {us}us — press Enter...")
         set_pulse(pca, us)
         try:
             input()
@@ -280,21 +284,21 @@ def _scan(pca):
 def main():
     print()
     print("=" * 50)
-    print("  MG996R SORTER SERVO TEST  (PCA9685 Ch 5)")
+    print("  MG996R SORTER SERVO TEST  (PCA9685 Ch 4)")
     print(f"  Addr=0x{PCA9685_ADDRESS:02X}  Ch={SERVO_CHANNEL}  {FREQ_HZ}Hz")
     print(f"  Neutral={PW_NEUTRAL}us  Reject={PW_REJECT}us  Qualified={PW_QUALIFIED}us")
     print("=" * 50)
 
     pca = init_servo()
 
-    Debug.step(3, "Moving to neutral position")
+    Debug.step(3, "Moving to neutral")
     go_neutral(pca)
 
     try:
         mode = input(
             "\nMode:\n"
-            "  [1] Automated test sequence\n"
-            "  [2] Interactive (manual control)\n"
+            "  [1] Automated test\n"
+            "  [2] Interactive\n"
             "  > "
         ).strip()
 

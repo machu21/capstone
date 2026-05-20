@@ -1,33 +1,44 @@
-from gpiozero.pins.lgpio import LGPIOFactory
-from gpiozero import Device
-Device.pin_factory = LGPIOFactory()
+"""
+dialogs/hardware_test.py
+────────────────────────
+Manual test controls for conveyor motor and sorter servo.
+"""
+
+import os
+import lgpio  # type: ignore
 
 from PyQt6.QtWidgets import (
     QDialog, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QMessageBox,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from utils import screen_size
 
-# ── Pin assignments ──────────────────────────────────────────────────────────
-PIN_MOTOR_IN1          = 17
-PIN_MOTOR_IN2          = 27
+os.environ["BLINKA_FORCEBOARD"] = "RASPBERRY_PI_5"
 
-PCA9685_ADDRESS        = 0x40
-PCA9685_SORTER_CHANNEL = 5
-SORTER_FREQ_HZ         = 50
+# ── Pin & Hardware assignments ───────────────────────────────────────────────
+GPIO_CHIP       = 0
+PIN_MOTOR_IN1   = 17
+PIN_MOTOR_IN2   = 27
 
-PW_NEUTRAL             = 1500
-PW_REJECT              =  900
-PW_QUALIFIED           = 2100
+PCA9685_ADDRESS = 0x40
+SERVO_CHANNEL   = 4
+FREQ_HZ         = 50
+
+PW_NEUTRAL      = 1500
+PW_REJECT       =  900
+PW_QUALIFIED    = 2100
+
 
 def _us_to_duty(us: int) -> int:
-    return int((us / (1_000_000 / SORTER_FREQ_HZ)) * 4096)
+    """Convert pulse width in microseconds to PCA9685 16-bit duty cycle."""
+    period_us = 1_000_000 / FREQ_HZ
+    return int((us / period_us) * 65535)
 
 
 class HardwareTestDialog(QDialog):
-    """Manual test controls for the conveyor motor and sorter servo."""
+    """Manual test controls for conveyor motor and sorter servo."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,70 +51,77 @@ class HardwareTestDialog(QDialog):
         fs    = max(13, int(18 * scale))
         btn_h = max(50, int(70 * scale))
 
-        if not self._init_gpio():
-            return
-
+        self._h = None
+        self._pca = None
+        
+        self._init_hardware()
         self._build_ui(scale, fs, btn_h)
 
-    # ── Hardware init ────────────────────────────────────────────────────────
+    # ── Hardware init ─────────────────────────────────────────────────────────
 
-    def _init_gpio(self) -> bool:
+    def _init_hardware(self):
+        # 1. Init Conveyor Motor via direct GPIO
         try:
-            from gpiozero import OutputDevice
-            self.motor_in1 = OutputDevice(PIN_MOTOR_IN1, active_high=True, initial_value=False)
-            self.motor_in2 = OutputDevice(PIN_MOTOR_IN2, active_high=True, initial_value=False)
+            self._h = lgpio.gpiochip_open(GPIO_CHIP)
+            lgpio.gpio_claim_output(self._h, PIN_MOTOR_IN1)
+            lgpio.gpio_claim_output(self._h, PIN_MOTOR_IN2)
         except Exception as e:
-            QMessageBox.critical(self, "Hardware Error", f"Motor GPIO failed:\n{e}")
-            self.reject()
-            return False
+            QMessageBox.critical(self, "Hardware Error", f"lgpio (Motor) init failed:\n{e}")
+            self._h = None
 
+        # 2. Init Sorter Servo via PCA9685
         try:
-            from adafruit_pca9685 import PCA9685   # type: ignore
-            import board, busio                     # type: ignore
-            i2c        = busio.I2C(board.SCL, board.SDA)
-            self._pca  = PCA9685(i2c, address=PCA9685_ADDRESS)
-            self._pca.frequency = SORTER_FREQ_HZ
-            self._sorter_ch = self._pca.channels[PCA9685_SORTER_CHANNEL]
-            self._set_pulse(PW_NEUTRAL)
+            import board                          # type: ignore
+            import busio                          # type: ignore
+            from adafruit_pca9685 import PCA9685  # type: ignore
+
+            i2c = busio.I2C(board.SCL, board.SDA)
+            self._pca = PCA9685(i2c, address=PCA9685_ADDRESS)
+            self._pca.frequency = FREQ_HZ
+
+            # Initialize to neutral, then cut PWM to stop jitter
+            self._pca.channels[SERVO_CHANNEL].duty_cycle = _us_to_duty(PW_NEUTRAL)
+            QTimer.singleShot(600, self._stop_pulse)
+
         except Exception as e:
-            QMessageBox.critical(self, "Hardware Error", f"PCA9685 servo failed:\n{e}")
-            self.reject()
-            return False
+            QMessageBox.critical(self, "Hardware Error", f"PCA9685 (Servo) init failed:\n{e}")
+            self._pca = None
 
-        return True
-
-    def _set_pulse(self, us: int):
-        if hasattr(self, '_sorter_ch'):
-            self._sorter_ch.duty_cycle = _us_to_duty(us) << 4
-
-    def _stop_pulse(self):
-        if hasattr(self, '_sorter_ch'):
-            self._sorter_ch.duty_cycle = 0
-
-    # ── Conveyor helpers ─────────────────────────────────────────────────────
+    # ── Conveyor helpers ──────────────────────────────────────────────────────
 
     def _conveyor_on(self):
-        self.motor_in1.on()
-        self.motor_in2.off()
+        if self._h:
+            lgpio.gpio_write(self._h, PIN_MOTOR_IN1, 1)
+            lgpio.gpio_write(self._h, PIN_MOTOR_IN2, 0)
 
     def _conveyor_off(self):
-        self.motor_in1.off()
-        self.motor_in2.off()
+        if self._h:
+            lgpio.gpio_write(self._h, PIN_MOTOR_IN1, 0)
+            lgpio.gpio_write(self._h, PIN_MOTOR_IN2, 0)
 
     # ── Servo helpers ─────────────────────────────────────────────────────────
 
     def _servo_reject(self):
-        self.sorter_servo.value = _deg_to_value(ANGLE_REJECT)
+        if self._pca:
+            self._pca.channels[SERVO_CHANNEL].duty_cycle = _us_to_duty(PW_REJECT)
+            QTimer.singleShot(600, self._stop_pulse)
 
     def _servo_neutral(self):
-        self.sorter_servo.value = _deg_to_value(ANGLE_NEUTRAL)
-        from PyQt6.QtCore import QTimer
-        pass  # lgpio does not support value=None; servo holds neutral position
+        if self._pca:
+            self._pca.channels[SERVO_CHANNEL].duty_cycle = _us_to_duty(PW_NEUTRAL)
+            QTimer.singleShot(600, self._stop_pulse)
 
     def _servo_qualified(self):
-        self.sorter_servo.value = _deg_to_value(ANGLE_QUALIFIED)
+        if self._pca:
+            self._pca.channels[SERVO_CHANNEL].duty_cycle = _us_to_duty(PW_QUALIFIED)
+            QTimer.singleShot(600, self._stop_pulse)
 
-    # ── UI ───────────────────────────────────────────────────────────────────
+    def _stop_pulse(self):
+        """Cuts the PWM signal completely to eliminate MG996R jitter and overheating."""
+        if self._pca:
+            self._pca.channels[SERVO_CHANNEL].duty_cycle = 0
+
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self, scale: float, fs: int, btn_h: int):
         main_layout = QVBoxLayout()
@@ -112,9 +130,7 @@ class HardwareTestDialog(QDialog):
         main_layout.setContentsMargins(20, 10, 20, 10)
 
         title = QLabel("Hardware Diagnostic Mode")
-        title.setStyleSheet(
-            f"font-size: {max(16, int(24*scale))}px; font-weight: bold; color: #333;"
-        )
+        title.setStyleSheet(f"font-size: {max(16, int(24*scale))}px; font-weight: bold; color: #333;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title)
 
@@ -174,16 +190,20 @@ class HardwareTestDialog(QDialog):
             row.addWidget(btn)
         return row
 
-    # ── Cleanup ──────────────────────────────────────────────────────────────
+    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def _cleanup(self):
-        if hasattr(self, "motor_in1"):
+        # Shut down motor
+        if self._h:
             self._conveyor_off()
-            self.motor_in1.close()
-            self.motor_in2.close()
-        if hasattr(self, "sorter_servo"):
-            self.sorter_servo.value = _deg_to_value(ANGLE_NEUTRAL)
-            self.sorter_servo.close()
+            lgpio.gpiochip_close(self._h)
+            self._h = None
+            
+        # Shut down servo
+        if self._pca:
+            self._pca.channels[SERVO_CHANNEL].duty_cycle = 0
+            self._pca.deinit()
+            self._pca = None
 
     def accept(self):
         self._cleanup()

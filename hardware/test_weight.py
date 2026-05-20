@@ -25,6 +25,7 @@ import traceback
 import time
 import json
 import os
+import statistics  # Add this to the top of your file with the other imports
 
 # ── Pin assignments ──────────────────────────────────────────────────────────
 PIN_DT  = 5
@@ -103,10 +104,14 @@ def init_hx711():
 # ── Raw reading ───────────────────────────────────────────────────────────────
 
 def read_raw_mean(hx, times: int = SAMPLE_TIMES) -> float | None:
-    """Get mean of raw ADC readings. Returns None on failure."""
+    """Get median of raw ADC readings to filter out OS timing spikes."""
     try:
         data = hx.get_raw_data(times=times)
-        if data and len(data) > 0:
+        if data and len(data) >= 3:
+            # Median completely ignores extreme high/low spikes 
+            # caused by Raspberry Pi GPIO bit-banging misses.
+            return statistics.median(data)
+        elif data and len(data) > 0:
             return sum(data) / len(data)
     except Exception:
         pass
